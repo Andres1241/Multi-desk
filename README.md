@@ -1,4 +1,4 @@
-#  Proyecto Individual  Segundo Cuatrimestre – Multi-Desk
+#  Proyecto grupal  Segundo Cuatrimestre – Multi-Desk
 
 
 ##  Descripción
