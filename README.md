@@ -15,11 +15,11 @@ Este repositorio contiene los proyectos realizados en el principio del segundo c
 
 ##  Herramientas utilizadas
 
--Xampp
-- Phpmyadmin
-- CSS
-- HTML
-- JS
+-Python
+- Visual Studio
+- Git
+- Github
+- 
 
 
 ---
@@ -30,8 +30,8 @@ Este repositorio contiene los proyectos realizados en el principio del segundo c
 
 1. -
 2. -
-3.
-4. 
+3. -
+4. -
 
 
 ---
@@ -40,7 +40,6 @@ Este repositorio contiene los proyectos realizados en el principio del segundo c
 ##  Capturas
 
 
-_Agregá tus propias capturas aquí:_
 
 
 -  Placeholder
