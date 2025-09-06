@@ -4,13 +4,11 @@ import os
 import cgi
 
 PORT = 8000
+BASE_DIR = os.path.join(os.path.expanduser("~"), "Compartidos")
 
-def get_base_directory():
-    base_dir = input("Ingrese la ruta base de los archivos a servir: ").strip()
-    if not os.path.isdir(base_dir):
-        print("La ruta no existe o no es un directorio. Usando el directorio actual.")
-        base_dir = os.getcwd()
-    return base_dir
+# Crear carpeta si no existe
+if not os.path.exists(BASE_DIR):
+    os.makedirs(BASE_DIR)
 
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, base_dir=None, **kwargs):
@@ -18,7 +16,6 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def list_files_page(self):
-        """Genera un HTML con los archivos disponibles y un formulario de subida"""
         files = os.listdir(self.base_dir)
         files = [f for f in files if os.path.isfile(os.path.join(self.base_dir, f))]
 
@@ -50,7 +47,6 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return super().do_GET()
 
     def do_POST(self):
-        """Maneja subida de archivos"""
         form = cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
@@ -63,14 +59,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             with open(filepath, "wb") as f:
                 f.write(uploaded_file.file.read())
             self.send_response(303)
-            self.send_header("Location", "/")  # redirige al index
+            self.send_header("Location", "/")
             self.end_headers()
         else:
             self.send_error(400, "No se envió archivo")
 
 if __name__ == "__main__":
-    base_dir = get_base_directory()
-    handler = lambda *args, **kwargs: CustomHandler(*args, base_dir=base_dir, **kwargs)
+    handler = lambda *args, **kwargs: CustomHandler(*args, base_dir=BASE_DIR, **kwargs)
     with socketserver.TCPServer(("", PORT), handler) as httpd:
-        print(f"Sirviendo archivos desde: {base_dir} en el puerto {PORT}")
+        print(f"Sirviendo archivos desde: {BASE_DIR} en el puerto {PORT}")
         httpd.serve_forever()
