@@ -10,19 +10,17 @@ import shutil
 import sys
 import urllib.parse
 import requests
-from bs4 import BeautifulSoup
 import json
 import sqlite3
 import hashlib
 import time
 
 # --- [ CONFIGURACIÓN GLOBAL ] ---
-PORT = 8000
 MULTIDESK_DIR = os.path.join(os.getcwd(), 'MultiDesk')
 UPLOAD_LOG_FILE = os.path.join(MULTIDESK_DIR, '.upload_log.json')
 DB_NAME = os.path.join(os.getcwd(), 'multidesk.db')
 FILE_UPDATE_INTERVAL = 5000 # 5 segundos
-HOST_SYSTEM_NAME = socket.gethostname() # 🔑 Nombre del sistema local: el identificador principal
+HOST_SYSTEM_NAME = socket.gethostname() 
 
 # --- [ FUNCIÓN AUXILIAR ] ---
 def open_file(filepath):
@@ -79,14 +77,24 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
+
+            # Registrar usuario al acceder a la lista (sin subir archivos)
+            uploader = self.headers.get('X-Username')
+            client_ip = self.get_client_ip()
+            if uploader and self.app and self.app.is_host:
+                self.server.user_map[client_ip] = uploader
             
-            files_data = []
+            files_data = {
+                'host_username': self.app.current_user if self.app and self.app.is_host else '',
+                'files': []
+            }
+            
             EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
             
             for fname in os.listdir(self.base_dir):
                 if os.path.isfile(os.path.join(self.base_dir, fname)) and not fname.startswith('.') and fname not in EXCLUDED_FILES:
                     uploader = self.app.upload_history.get(fname, '') if self.app else ''
-                    files_data.append({'name': urllib.parse.quote(fname), 'uploader': uploader}) 
+                    files_data['files'].append({'name': urllib.parse.quote(fname), 'uploader': uploader}) 
             
             self.wfile.write(json.dumps(files_data).encode('utf-8'))
 
@@ -148,6 +156,29 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(500, f"Error interno: {e}")
 
 
+# --- [ PANEL DE DEBUG ] ---
+class DebugPanel:
+    def __init__(self, master, app):
+        self.app = app
+        self.dialog = Toplevel(master)
+        self.dialog.title("Panel de Diagnóstico")
+        self.dialog.geometry("500x150")
+        self.dialog.transient(master)
+        
+        tk.Label(self.dialog, text="Estado de la Conexión:", font=('Arial', 12, 'bold')).pack(pady=5)
+        self.debug_text = tk.StringVar(self.dialog, value="")
+        self.debug_label = tk.Label(self.dialog, textvariable=self.debug_text, font=('Arial', 10), justify=tk.LEFT)
+        self.debug_label.pack(pady=10, padx=10)
+
+    def update_info(self, message, is_error=False):
+        color = 'red' if is_error else 'blue'
+        prefix = "[ERROR] " if is_error else "[DEBUG] "
+        
+        # Usamos after(0, ...) para asegurarnos de que la actualización de la GUI se haga en el hilo principal
+        self.dialog.after(0, lambda: self.debug_label.config(fg=color))
+        self.dialog.after(0, lambda: self.debug_text.set(prefix + message))
+
+
 # --- [ PANEL DE CONTROL DEL HOST ] ---
 class HostControlPanel:
     def __init__(self, master, app):
@@ -176,7 +207,7 @@ class HostControlPanel:
 
 
     def _setup_users_tab(self):
-        tk.Label(self.tab_users, text="Usuarios activos (se registran al subir un archivo):", font=('Arial', 10)).pack(pady=5)
+        tk.Label(self.tab_users, text="Usuarios activos:", font=('Arial', 10)).pack(pady=5)
         
         self.users_listbox = tk.Listbox(self.tab_users, width=50, height=15)
         self.users_listbox.pack(pady=10, padx=10)
@@ -267,11 +298,17 @@ class HostControlPanel:
             messagebox.showinfo("Éxito", f"Se eliminaron {files_deleted} archivos de la sala.")
 
     def close_room(self):
-        if self.app.server:
-            threading.Thread(target=self.app.server.shutdown).start()
-        messagebox.showinfo("Sala Cerrada", "El servidor se ha detenido. Volviendo al menú principal.")
-        self.dialog.destroy()
-        self.app.setup_main_menu()
+        # El host debe confirmar que desea cerrar la sala
+        if messagebox.askyesno("Cerrar Sala", "¿Estás seguro de que quieres cerrar la sala y desconectar a todos los usuarios?"):
+            if self.app.server:
+                # El shutdown debe ejecutarse en un hilo separado ya que bloquea el hilo principal
+                threading.Thread(target=self.app.server.shutdown, daemon=True).start()
+                self.app.server = None # Limpiar la referencia
+            
+            self.dialog.destroy()
+            self.app.is_host = False
+            self.app.setup_main_menu()
+
 
 # --- [ APLICACIÓN TKINTER ] ---
 class MultiDeskApp:
@@ -283,43 +320,51 @@ class MultiDeskApp:
         self.server = None
         self.host_ip = ''
         self.local_ip = self._get_local_ip()
-        self.debug_label = None
         self.files_listbox = None
         self.last_files = set()
         self.selected_file_name = None
         self.upload_history = {}
         self.session = requests.Session()
         self.current_user = None
+        self.host_username = None
+        self.room_title_var = None
         self.client_updater_running = False
+        self.ip_display_label = None
+        self.debug_panel_instance = None
+        self.port = 8000  # Puerto predeterminado
+        self.server_error = None # 🆕 Para comunicar errores de servidor del hilo (ej. puerto ocupado)
 
         self.setup_db()
         self.setup_main_menu()
         self.load_upload_history()
         
+    # Función centralizada para actualizar el panel de debug
+    def update_debug_info(self, message, is_error=False):
+        if self.debug_panel_instance:
+            self.debug_panel_instance.update_info(message, is_error)
+        else:
+            # Si el panel no está abierto, imprime en consola
+            print(f"{'[ERROR]' if is_error else '[DEBUG]'} {message}")
+
     # --- [ Funciones de Red ] ---
     def _get_local_ip(self):
         try:
+            # Método más robusto para obtener la IP LAN
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
+            s.settimeout(0)
+            # Intenta conectarse a una IP no enrutada (no envía datos), solo para obtener la IP de la interfaz
+            s.connect(('10.255.255.255', 1))
+            IP = s.getsockname()[0]
             s.close()
-            return ip
+            return IP
         except Exception:
             return "127.0.0.1"
             
-    def _resolve_host_ip(self, host_name):
-        """Intenta resolver el nombre de host a una IP, incluyendo un fallback para mDNS."""
-        try:
-            # 1. Intenta resolver el nombre de host directamente
-            ip = socket.gethostbyname(host_name)
-            return ip
-        except socket.gaierror:
-            # 2. Si falla, intenta agregar .local (común en redes con mDNS)
-            try:
-                ip = socket.gethostbyname(f"{host_name}.local")
-                return ip
-            except socket.gaierror:
-                return None # Resolución fallida
+    # Función para mostrar la IP local
+    def get_my_ip_for_sharing(self):
+        """Muestra la dirección IP local del equipo bajo el botón."""
+        if self.ip_display_label:
+            self.ip_display_label.config(text=f"Tu dirección IP local es: {self.local_ip}", fg='darkgreen')
 
     # --- [ Gestión de Base de Datos SQLite ] ---
     def setup_db(self):
@@ -328,7 +373,7 @@ class MultiDeskApp:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS Usuarios (
                 id INTEGER PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL, -- 🔑 El username debe ser UNICO
+                username TEXT UNIQUE NOT NULL, 
                 password_hash TEXT NOT NULL
             )
         ''')
@@ -353,7 +398,7 @@ class MultiDeskApp:
             self.current_user = username
             return True, "Registro exitoso."
         except sqlite3.IntegrityError:
-            return False, "El usuario ya existe. El nombre de usuario debe ser único." # 🔑 Mensaje de unicidad
+            return False, "El usuario ya existe. El nombre de usuario debe ser único."
         except Exception as e:
             return False, f"Error: {e}"
 
@@ -402,14 +447,40 @@ class MultiDeskApp:
     # --- [ GUI PRINCIPAL ] ---
     def setup_main_menu(self):
         self.client_updater_running = False
+        self.host_username = None
+        self.room_title_var = None
+        
+        # Destruye el panel de debug si existe al volver al menú principal
+        if self.debug_panel_instance and self.debug_panel_instance.dialog.winfo_exists():
+             self.debug_panel_instance.dialog.destroy()
+        self.debug_panel_instance = None
+        
         for widget in self.root.winfo_children():
             widget.destroy()
         tk.Label(self.root, text='MultiDesk', font=('Arial', 18)).pack(pady=10)
         tk.Button(self.root, text='Hostear sala', width=20, command=self.host_room).pack(pady=5)
         tk.Button(self.root, text='Conectarse a sala', width=20, command=self.connect_room).pack(pady=5)
+        
+        # Botón de accesibilidad y Label de visualización
+        tk.Button(self.root, text='Mostrar mi dirección IP', width=40, command=self.get_my_ip_for_sharing, bg='yellow').pack(pady=10)
+        self.ip_display_label = tk.Label(self.root, text='', font=('Arial', 10, 'bold'))
+        self.ip_display_label.pack(pady=2)
+        
         tk.Button(self.root, text='Registrar usuario', width=20, command=self.show_register_dialog).pack(pady=5)
-        self.debug_label = tk.Label(self.root, text='', fg='blue')
-        self.debug_label.pack(pady=2)
+        
+    def show_port_dialog(self, initial_port):
+        """Muestra un diálogo para que el usuario configure el puerto de conexión."""
+        new_port = simpledialog.askinteger('Configurar Puerto', 
+                                          f'Ingresa un nuevo puerto (Actual: {initial_port}).',
+                                          initialvalue=initial_port,
+                                          minvalue=1024, maxvalue=65535)
+        return new_port
+
+    def open_debug_panel(self):
+        # Se asegura de crear el panel solo si no existe
+        if not self.debug_panel_instance or not self.debug_panel_instance.dialog.winfo_exists():
+            self.debug_panel_instance = DebugPanel(self.root, self)
+        self.debug_panel_instance.dialog.lift()
 
     def _ask_credentials_and_authenticate(self):
         if self.current_user:
@@ -437,7 +508,7 @@ class MultiDeskApp:
                     return self.current_user is not None 
                 return False
             else:
-                messagebox.showerror('Error', 'Contraseña incorrecta.')
+                messagebox.showerror('Error', msg)
                 return False
 
     def show_register_dialog(self, username=None, password=None):
@@ -474,52 +545,156 @@ class MultiDeskApp:
     def host_room(self):
         if not self._ask_credentials_and_authenticate():
             return
+            
         if not os.path.exists(MULTIDESK_DIR):
             os.makedirs(MULTIDESK_DIR)
-        self.is_host = True
-        self.start_server()
-        self.show_room_window()
         
-        if self.server:
-            self.server.user_map[self.local_ip] = self.current_user
+        self.is_host = True
+        self.host_username = self.current_user
+        
+        # 1. Creamos un Event para que el thread pueda avisar que terminó de intentar iniciar
+        self.server_started_event = threading.Event() 
+        self.server_error = None # Limpiamos el error anterior
+        self._start_server_thread()
+        
+        # 2. Esperamos a que el thread termine de intentar iniciar (máx. 5 seg)
+        self.server_started_event.wait(timeout=5)
+        
+        # 3. Verificamos el resultado en el hilo principal
+        if self.server_error:
+            # Si hubo un error capturado en el hilo, lo manejamos
+            self._handle_server_startup_error() 
+        elif self.server:
+            # Si el servidor se inicializó correctamente
+            self._on_server_started_successfully()
+        else:
+            # Si el evento no se activó (timeout) o el servidor es None (fallo desconocido)
+            messagebox.showerror("Error de Host", "El intento de hostear la sala falló sin un error específico. Inténtalo de nuevo.")
+            self.is_host = False
+            self.setup_main_menu()
+
+    def _start_server_thread(self):
+        """Inicia el servidor en un hilo separado."""
+        def run_server():
+            try:
+                handler = lambda *args, **kwargs: CustomHandler(*args, app_instance=self, base_dir=MULTIDESK_DIR, **kwargs)
+                
+                # Intenta iniciar el servidor 
+                self.server = AuthTCPServer(("0.0.0.0", self.port), handler, set())
+                self.server.app_instance = self
+                
+                # Éxito: Indica al hilo principal que proceda
+                self.server_started_event.set()
+                
+                self.server.serve_forever()
+                
+            except (OSError, socket.error) as e:
+                # Fallo: Almacena el error y notifica al hilo principal
+                self.server_error = str(e)
+                self.server = None # Aseguramos que la referencia del server es nula
+                self.server_started_event.set() # Notifica al hilo principal que la espera ha terminado
+                print(f"[SERVER THREAD FAIL] Error capturado: {self.server_error}") # Debug interno
             
-        # 🔑 Muestra el Host System Name como identificador principal
-        self.debug_label.config(text=f'[DEBUG] Hosteando en {HOST_SYSTEM_NAME} ({self.local_ip}:{PORT})')
+        self.server_thread = threading.Thread(target=run_server, daemon=True)
+        self.server_thread.start()
+
+    def _on_server_started_successfully(self):
+        """Se ejecuta después de que el servidor se inicia sin errores."""
+        messagebox.showinfo(
+            "Dirección IP del Host", 
+            f"Tu dirección IP que deben usar los clientes es:\n\n{self.local_ip}\n\n"
+            f"¡Asegúrate de que el puerto {self.port} esté abierto en tu firewall!"
+        )
+        self.show_room_window()
+        self.server.user_map[self.local_ip] = self.current_user
+        self.open_debug_panel() 
+        self.update_debug_info(f'Hosteando: {self.local_ip} en puerto {self.port}')
+        
+    def _handle_server_startup_error(self):
+        """Maneja el error devuelto por el hilo del servidor en el hilo principal."""
+        error_msg = self.server_error
+        self.is_host = False # Resetea el estado host si el inicio falló.
+        self.server_error = None # Limpia el error
+
+        # Detección de error de "Address already in use" o "Puerto en uso"
+        if 'address already in use' in error_msg.lower() or 'en uso' in error_msg.lower() or any(err in error_msg for err in ['10048', '98', '48']):
+            self._handle_port_in_use_error_dialog() # Muestra el diálogo de reintento
+        else:
+            # Error inesperado
+            messagebox.showerror("Error de Host", f"Error inesperado al iniciar el servidor: {error_msg}")
+            self.setup_main_menu()
+
+    def _handle_port_in_use_error_dialog(self):
+        """Muestra el diálogo para cambiar de puerto y reintentar."""
+        if not messagebox.askyesno(
+            "Error al Hostear Sala (Puerto en uso)",
+            f"El puerto {self.port} no está disponible, probablemente lo está usando otra aplicación.\n"
+            "¿Quieres ingresar un **puerto diferente** para intentar hostear la sala de nuevo?"
+        ):
+            self.setup_main_menu()
+            return
+        
+        # Si el usuario quiere cambiar el puerto
+        new_port = self.show_port_dialog(self.port + 1)
+        
+        if new_port:
+            self.port = new_port
+            messagebox.showinfo("Reintento", f"Intentando hostear la sala con el nuevo puerto: {self.port}...")
+            # Intenta hostear de nuevo con el nuevo puerto (recursivo)
+            self.host_room() 
+        else:
+            self.setup_main_menu()
 
     def connect_room(self):
         if not self._ask_credentials_and_authenticate():
             return
         
-        # 🔑 Pide SOLO el nombre del sistema Host, no la IP
-        host_system_name_input = simpledialog.askstring('Conectar', 'Nombre del Host del Sistema (ej. "PC-Oficina"):')
-        if host_system_name_input:
-            ip = self._resolve_host_ip(host_system_name_input)
-            
-            if ip:
-                self.host_ip = ip
-                self.is_host = False
-                
-                # 🔑 Verifica la conexión antes de abrir la sala
-                if self.connect_to_server(ip):
-                    self.show_room_window()
-                    self.debug_label.config(text=f'[DEBUG] Conectado a {host_system_name_input} ({ip}:{PORT})')
-                    
-                    self.client_updater_running = True
-                    threading.Thread(target=self.fetch_and_update_client_files, daemon=True).start()
-                else:
-                    # 🔑 Mensaje de error claro para fallos de conexión (firewall/host inactivo)
-                    messagebox.showerror('Error de Conexión', 'No se pudo establecer la conexión. Verifica que el Host esté activo y que el cortafuegos permita el puerto 8000.')
+        # Pide la IP y el Puerto al Cliente
+        host_info = simpledialog.askstring('Conectar', 
+                                          f'Dirección y Puerto del Host (ej. 192.168.1.10:{self.port}):',
+                                          initialvalue=f'{self.local_ip}:{self.port}')
+        if not host_info:
+            return
+        
+        try:
+            if ':' in host_info:
+                ip_parts = host_info.split(':')
+                self.host_ip = ip_parts[0].strip()
+                self.port = int(ip_parts[1].strip())
             else:
-                 messagebox.showerror('Error de Conexión', 'No se pudo resolver el nombre de Host. Asegúrate de que el nombre sea correcto y que ambos equipos estén en la misma red local.')
+                self.host_ip = host_info.strip()
+            
+            if not self.host_ip:
+                 messagebox.showerror('Error', 'Debe ingresar una dirección IP válida.')
+                 return
                  
+        except (ValueError, IndexError):
+            messagebox.showerror('Error', 'Formato de IP y Puerto incorrecto. Use: IP:PUERTO o solo IP.')
+            return
+
+
+        self.is_host = False
+
+        if self.connect_to_server(self.host_ip):
+            self.show_room_window()
+            self.open_debug_panel()
+            self.update_debug_info(f'Conectado a {self.host_ip} en puerto {self.port}')
+            
+            self.client_updater_running = True
+            threading.Thread(target=self.fetch_and_update_client_files, daemon=True).start()
+        else:
+            messagebox.showerror('Error de Conexión', 
+                                 f'No se pudo establecer la conexión HTTP con {self.host_ip} usando el puerto {self.port}.\nVerifica que el Host haya iniciado la sala y que el puerto {self.port} no esté bloqueado por un cortafuegos en ambos equipos.')
+             
     def connect_to_server(self, ip):
         """Intenta realizar una petición GET para verificar si el servidor está activo."""
         try:
-            r = self.session.get(f'http://{ip}:{PORT}/', timeout=3)
+            r = self.session.get(f'http://{ip}:{self.port}/', timeout=3)
             r.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            print(f"[ERROR CONNECT] Falló la prueba de conexión: {e}")
+            # Captura el error para el debug panel (aunque no esté visible, registra el intento)
+            self.update_debug_info(f'Error al conectar: {e}', is_error=True)
             return False
 
     def show_room_window(self):
@@ -529,17 +704,27 @@ class MultiDeskApp:
         top_frame = tk.Frame(self.root)
         top_frame.pack(pady=10, padx=10, fill='x')
         
-        tk.Label(top_frame, text=f'Sala de {self.current_user}', font=('Arial', 16)).pack(side=tk.LEFT)
+        self.room_title_var = tk.StringVar(self.root)
+        
+        if self.is_host:
+            self.room_title_var.set(f'Sala: {self.current_user} (HOST) | Puerto: {self.port}')
+        else:
+            self.room_title_var.set(f'Sala: (Cliente) - {self.current_user} | Puerto: {self.port}')
+
+        tk.Label(top_frame, textvariable=self.room_title_var, font=('Arial', 16)).pack(side=tk.LEFT)
         
         if self.is_host:
             tk.Button(top_frame, text='Panel de Control', command=self.open_control_panel, bg='lightblue').pack(side=tk.RIGHT)
-
+        
+        # Botón para abrir el panel de Debug (SOLO en la Sala)
+        tk.Button(self.root, text='Diagnóstico', command=self.open_debug_panel, bg='lightgray').pack(pady=5)
+        
         tk.Button(self.root, text='Seleccionar Archivo', command=self.select_file).pack(pady=5)
         tk.Button(self.root, text='Salir', command=self.leave_room).pack(pady=5)
         
-        self.debug_label = tk.Label(self.root, text='', fg='blue')
-        self.debug_label.pack(pady=2)
-        
+        # Etiqueta de la lista de archivos
+        tk.Label(self.root, text='Lista de Archivos Compartidos:', font=('Arial', 10, 'bold')).pack(pady=(10, 0))
+
         self.files_listbox = tk.Listbox(self.root, width=70)
         self.files_listbox.pack()
         self.files_listbox.bind('<Double-Button-1>', self.open_selected_file)
@@ -550,27 +735,37 @@ class MultiDeskApp:
 
     def leave_room(self):
         self.client_updater_running = False
-        if self.server:
-            threading.Thread(target=self.server.shutdown).start()
+        
+        if self.is_host:
+            # Limpieza para el HOST: Apagar el servidor completamente
+            if self.server:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                self.server = None
+            self.is_host = False
+            self.update_debug_info("Servidor detenido.", is_error=False)
+            messagebox.showinfo("Sala Cerrada", "El servidor se ha detenido. Volviendo al menú principal.")
+        
+        # Limpieza para el CLIENTE: simplemente vuelve al menú principal y resetea el puerto a 8000
+        self.port = 8000
         self.setup_main_menu()
-
-    def start_server(self):
-        def run_server():
-            handler = lambda *args, **kwargs: CustomHandler(*args, app_instance=self, base_dir=MULTIDESK_DIR, **kwargs)
-            self.server = AuthTCPServer(("0.0.0.0", PORT), handler, set())
-            self.server.app_instance = self
-            self.server.serve_forever()
-        self.server_thread = threading.Thread(target=run_server, daemon=True)
-        self.server_thread.start()
 
     def fetch_and_update_client_files(self):
         while self.client_updater_running:
             try:
-                url = f'http://{self.host_ip}:{PORT}/files_list'
-                r = self.session.get(url, timeout=3)
+                url = f'http://{self.host_ip}:{self.port}/files_list'
+                # Envía el Username en el encabezado para registrarse en el Host
+                headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip} 
+                r = self.session.get(url, headers=headers, timeout=3)
                 r.raise_for_status()
 
-                files_data = r.json()
+                files_response = r.json()
+                
+                self.host_username = files_response['host_username']
+                
+                # Actualiza el título del Label en la ventana principal
+                self.root.after(0, lambda: self.room_title_var.set(f'Sala: {self.host_username} (HOST) - {self.current_user} (Cliente) | Puerto: {self.port}'))
+                
+                files_data = files_response['files']
                 
                 if self.files_listbox:
                     self.files_listbox.delete(0, tk.END)
@@ -579,11 +774,13 @@ class MultiDeskApp:
                         uploader = item['uploader']
                         display = f"{fname:<40} (Subido por: {uploader})" if uploader else fname
                         self.files_listbox.insert(tk.END, display)
+                    
+                    self.update_debug_info("Lista de archivos actualizada.", is_error=False)
                         
-            except requests.exceptions.RequestException:
+            except requests.exceptions.RequestException as e:
                 if self.client_updater_running:
-                     # Si falla, no hace nada y espera al siguiente intento
-                     pass
+                    # Muestra error de actualización en el panel
+                    self.update_debug_info(f"Fallo al obtener lista de archivos: {e}", is_error=True)
             
             time.sleep(FILE_UPDATE_INTERVAL / 1000)
 
@@ -605,7 +802,7 @@ class MultiDeskApp:
             try:
                 with open(file_path, 'rb') as f:
                     data = f.read()
-                url = f'http://{self.host_ip}:{PORT}/'
+                url = f'http://{self.host_ip}:{self.port}/'
                 headers = {'X-Filename': urllib.parse.quote(file_name), 
                            'X-Client-Ip': self.local_ip, 
                            'X-Username': self.current_user}
@@ -613,11 +810,13 @@ class MultiDeskApp:
                 if r.status_code == 200:
                     shutil.copy(file_path, dest_path) 
                     messagebox.showinfo("Archivo enviado", f"Se subió {file_name}.")
+                else:
+                    self.update_debug_info(f"Fallo al subir archivo. Código HTTP: {r.status_code}", is_error=True)
             except Exception as e:
-                self.debug_label.config(text=f'[DEBUG] Error de envío: {e}')
+                self.update_debug_info(f'Error de envío: {e}', is_error=True)
 
     def update_files(self):
-        if self.is_host and self.files_listbox:
+        if self.files_listbox:
             self.files_listbox.delete(0, tk.END)
             
             EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
