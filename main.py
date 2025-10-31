@@ -32,6 +32,25 @@ def open_file(filepath):
     elif os.name == 'posix':
         os.system(f'xdg-open "{filepath}"')
 
+# Función para limpieza (usada al cerrar en modo temporal)
+def cleanup_multidesk(is_host=False):
+    """Elimina todos los archivos del directorio MultiDesk, excluyendo logs y DB."""
+    EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
+    
+    # El host puede tener un registro de uploads vacío, el cliente no
+    if not is_host:
+        EXCLUDED_FILES.add(os.path.basename(os.path.join(os.getcwd(), 'multidesk.db'))) # Protege la DB del cliente
+        
+    files_deleted = 0
+    for fname in os.listdir(MULTIDESK_DIR):
+        filepath = os.path.join(MULTIDESK_DIR, fname)
+        if os.path.isfile(filepath) and not fname.startswith('.') and fname not in EXCLUDED_FILES:
+            try:
+                os.remove(filepath)
+                files_deleted += 1
+            except Exception as e:
+                print(f"Error al borrar {fname} durante la limpieza: {e}")
+    return files_deleted
 
 # --- [ SERVIDOR Y HANDLER HTTP ] ---
 class AuthTCPServer(socketserver.TCPServer):
@@ -63,6 +82,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         return self.client_address[0]
 
     def do_GET(self):
+        # 🆕 Permite manejar archivos con caracteres especiales decodificando el path
         local_path = urllib.parse.unquote(self.path.lstrip('/'))
         file_path = os.path.join(self.base_dir, local_path)
 
@@ -83,6 +103,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             client_ip = self.get_client_ip()
             if uploader and self.app and self.app.is_host:
                 self.server.user_map[client_ip] = uploader
+                self.app.update_debug_info(f"Usuario {uploader} ({client_ip}) consultando lista de archivos.") # 🆕 Debug Host
             
             files_data = {
                 'host_username': self.app.current_user if self.app and self.app.is_host else '',
@@ -94,11 +115,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             for fname in os.listdir(self.base_dir):
                 if os.path.isfile(os.path.join(self.base_dir, fname)) and not fname.startswith('.') and fname not in EXCLUDED_FILES:
                     uploader = self.app.upload_history.get(fname, '') if self.app else ''
+                    # 🆕 Asegura que el nombre del archivo esté codificado en la respuesta JSON
                     files_data['files'].append({'name': urllib.parse.quote(fname), 'uploader': uploader}) 
             
             self.wfile.write(json.dumps(files_data).encode('utf-8'))
 
         elif self.path == '/':
+            # ... (Lógica de la página HTML simple) ...
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
@@ -111,13 +134,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 if os.path.isfile(os.path.join(self.base_dir, fname)) and not fname.startswith('.'):
                     if fname in EXCLUDED_FILES:
                         continue
+                    # 🆕 Codificación URL para que el navegador lo maneje bien
                     html += f'<li><a href="{urllib.parse.quote(fname)}">{fname}</a></li>'
             html += "</ul></body></html>"
             self.wfile.write(html.encode('utf-8'))
 
+        # 🆕 El acceso a archivos se realiza con el nombre decodificado (local_path)
         elif os.path.isfile(file_path):
             self.send_response(200)
             self.send_header("Content-type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{local_path}"') # 🆕 Header para sugerir descarga con nombre original
             self.send_header("Content-Length", str(os.path.getsize(file_path)))
             self.end_headers()
             with open(file_path, 'rb') as f:
@@ -129,6 +155,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         try:
             length = int(self.headers['Content-Length'])
             field_data = self.rfile.read(length)
+            
             fname_encoded = self.headers.get('X-Filename')
             client_ip = self.get_client_ip()
 
@@ -138,6 +165,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 
                 if uploader and self.server.app_instance and self.server.app_instance.is_host:
                     self.server.user_map[client_ip] = uploader
+                    self.app.update_debug_info(f"Subida de {uploader}: {fname}") # 🆕 Debug Host
                     
                 file_path = os.path.join(self.base_dir, fname)
                 with open(file_path, 'wb') as f:
@@ -155,28 +183,93 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             print(f"[ERROR POST] {e}")
             self.send_error(500, f"Error interno: {e}")
 
+    # 🆕 Maneja la eliminación de usuarios y archivos
+    def do_DELETE(self):
+        client_ip = self.get_client_ip()
+        username = self.headers.get('X-Username')
+        
+        # 1. Solicitud de Salida de Cliente (/leave)
+        if self.path == '/leave':
+            if username and self.app and self.app.is_host:
+                self.app.remove_client(client_ip, username)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'OK')
+            return
+
+        # 2. Solicitud de Eliminación de Archivo (/delete_file)
+        elif self.path == '/delete_file':
+            filename_encoded = self.headers.get('X-Filename')
+            if not filename_encoded:
+                self.send_error(400, "Filename header missing")
+                return
+
+            filename = urllib.parse.unquote(filename_encoded)
+            success, msg = self.app.host_delete_file_check(filename, username) # 🆕 Lógica en App
+
+            if success:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'OK')
+            else:
+                self.send_error(403, msg) # 403 Prohibido o 400 Bad Request
+            return
+
+        self.send_error(404)
 
 # --- [ PANEL DE DEBUG ] ---
 class DebugPanel:
     def __init__(self, master, app):
+        self.master = master
         self.app = app
         self.dialog = Toplevel(master)
-        self.dialog.title("Panel de Diagnóstico")
-        self.dialog.geometry("500x150")
+        self.dialog.title("Panel de Diagnóstico (Debug)")
+        self.dialog.geometry("600x350")
         self.dialog.transient(master)
-        
-        tk.Label(self.dialog, text="Estado de la Conexión:", font=('Arial', 12, 'bold')).pack(pady=5)
-        self.debug_text = tk.StringVar(self.dialog, value="")
-        self.debug_label = tk.Label(self.dialog, textvariable=self.debug_text, font=('Arial', 10), justify=tk.LEFT)
-        self.debug_label.pack(pady=10, padx=10)
+        self.dialog.grab_set()
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Contenedor para la lista de mensajes
+        frame = tk.Frame(self.dialog)
+        frame.pack(pady=10, padx=10, expand=True, fill="both")
+
+        # Configuración del Listbox y Scrollbar
+        scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
+        self.info_listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, width=80, height=15)
+        scrollbar.config(command=self.info_listbox.yview)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.info_listbox.pack(side=tk.LEFT, fill="both", expand=True)
+
+        self.add_system_info()
+
+    def add_system_info(self):
+        """Añade información de sistema al inicio del panel."""
+        self.update_info(f"--- [ INICIO DEL DIAGNÓSTICO ] ---")
+        self.update_info(f"Sistema Operativo: {sys.platform} ({os.name})")
+        self.update_info(f"Hostname: {HOST_SYSTEM_NAME}")
+        self.update_info(f"IP Local (Reportada): {self.app.local_ip}")
+        self.update_info(f"Directorio MultiDesk: {MULTIDESK_DIR}")
+        self.update_info(f"---")
 
     def update_info(self, message, is_error=False):
-        color = 'red' if is_error else 'blue'
-        prefix = "[ERROR] " if is_error else "[DEBUG] "
+        """Función para añadir mensajes al listbox desde cualquier parte de la app."""
+        color = 'red' if is_error else 'darkgreen' if message.startswith('[DEBUG]') else 'black'
         
-        # Usamos after(0, ...) para asegurarnos de que la actualización de la GUI se haga en el hilo principal
-        self.dialog.after(0, lambda: self.debug_label.config(fg=color))
-        self.dialog.after(0, lambda: self.debug_text.set(prefix + message))
+        # Insertar con la hora actual
+        now = time.strftime("[%H:%M:%S]")
+        display_message = f"{now} {message}"
+        
+        self.info_listbox.insert(tk.END, display_message)
+        self.info_listbox.itemconfig(tk.END, {'fg': color})
+        
+        # Scroll automático al final
+        self.info_listbox.see(tk.END)
+
+    def on_close(self):
+        """Limpia la referencia al cerrar el panel."""
+        self.app.debug_panel_instance = None
+        self.dialog.destroy()
 
 
 # --- [ PANEL DE CONTROL DEL HOST ] ---
@@ -301,10 +394,18 @@ class HostControlPanel:
         # El host debe confirmar que desea cerrar la sala
         if messagebox.askyesno("Cerrar Sala", "¿Estás seguro de que quieres cerrar la sala y desconectar a todos los usuarios?"):
             if self.app.server:
+                # 🆕 Indica que el servidor está cerrado antes del shutdown
+                self.app.server.closed = True 
+                
                 # El shutdown debe ejecutarse en un hilo separado ya que bloquea el hilo principal
                 threading.Thread(target=self.app.server.shutdown, daemon=True).start()
                 self.app.server = None # Limpiar la referencia
-            
+                
+            # 🆕 Limpieza si el HOST está en modo temporal
+            if self.app.is_temporal_mode.get():
+                cleanup_count = cleanup_multidesk(is_host=True)
+                messagebox.showinfo("Limpieza", f"Modo temporal activo: Se eliminaron {cleanup_count} archivos locales.")
+
             self.dialog.destroy()
             self.app.is_host = False
             self.app.setup_main_menu()
@@ -332,7 +433,8 @@ class MultiDeskApp:
         self.ip_display_label = None
         self.debug_panel_instance = None
         self.port = 8000  # Puerto predeterminado
-        self.server_error = None # 🆕 Para comunicar errores de servidor del hilo (ej. puerto ocupado)
+        self.server_error = None # Para comunicar errores de servidor del hilo (ej. puerto ocupado)
+        self.is_temporal_mode = tk.BooleanVar(value=False)
 
         self.setup_db()
         self.setup_main_menu()
@@ -438,6 +540,40 @@ class MultiDeskApp:
                     self.upload_history = json.load(f)
             except Exception:
                 self.upload_history = {}
+    
+    # 🆕 Función para eliminar clientes (usada por do_DELETE /leave)
+    def remove_client(self, client_ip, username):
+        if self.server:
+            if client_ip in self.server.user_map and self.server.user_map[client_ip] == username:
+                del self.server.user_map[client_ip]
+                self.update_debug_info(f"Usuario {username} ({client_ip}) se desconectó.")
+            if client_ip in self.server.participants_ips:
+                 self.server.participants_ips.remove(client_ip)
+
+    # 🆕 Función para que el Host verifique la eliminación solicitada por el Cliente
+    def host_delete_file_check(self, filename, username):
+        if not self.is_host:
+            return False, "No autorizado: No es el host."
+            
+        uploader = self.upload_history.get(filename)
+        
+        if uploader != username:
+            return False, f"No autorizado: Solo el uploader ({uploader}) puede eliminar este archivo."
+            
+        filepath = os.path.join(MULTIDESK_DIR, filename)
+        if not os.path.exists(filepath):
+            return False, "Archivo no encontrado."
+            
+        try:
+            os.remove(filepath)
+            if filename in self.upload_history:
+                del self.upload_history[filename]
+            self.save_upload_history()
+            self.update_files()
+            self.update_debug_info(f"Archivo eliminado por {username}: {filename}")
+            return True, "Archivo eliminado correctamente."
+        except Exception as e:
+            return False, f"Error al eliminar {filename}: {e}"
 
     def register_upload(self, filename, uploader):
         self.upload_history[filename] = uploader
@@ -455,18 +591,34 @@ class MultiDeskApp:
              self.debug_panel_instance.dialog.destroy()
         self.debug_panel_instance = None
         
+        # 🆕 Llama a la limpieza si estaba activo el modo temporal al salir
+        if self.is_temporal_mode.get():
+            cleanup_multidesk(is_host=self.is_host)
+            messagebox.showinfo("Limpieza", "El contenido temporal de MultiDesk ha sido eliminado.")
+            
+        # 🆕 Restablece el estado de host
+        self.is_host = False 
+        
         for widget in self.root.winfo_children():
             widget.destroy()
+            
         tk.Label(self.root, text='MultiDesk', font=('Arial', 18)).pack(pady=10)
+        
+        # 🆕 Checkbox de Modo Temporal
+        tk.Checkbutton(self.root, text="Modo Temporal (Eliminar archivos al cerrar)", variable=self.is_temporal_mode, 
+                       font=('Arial', 10), fg='orange').pack(pady=5)
+     
         tk.Button(self.root, text='Hostear sala', width=20, command=self.host_room).pack(pady=5)
         tk.Button(self.root, text='Conectarse a sala', width=20, command=self.connect_room).pack(pady=5)
         
         # Botón de accesibilidad y Label de visualización
-        tk.Button(self.root, text='Mostrar mi dirección IP', width=40, command=self.get_my_ip_for_sharing, bg='yellow').pack(pady=10)
+        tk.Button(self.root, text='Mostrar mi dirección IP', width=40, command=self.get_my_ip_for_sharing, bg='#FF4500').pack(pady=10)
         self.ip_display_label = tk.Label(self.root, text='', font=('Arial', 10, 'bold'))
         self.ip_display_label.pack(pady=2)
         
-        tk.Button(self.root, text='Registrar usuario', width=20, command=self.show_register_dialog).pack(pady=5)
+        tk.Button(self.root, text='Registrar usuario', width=20, 
+        command=self.show_register_dialog).pack(pady=5)
+          
         
     def show_port_dialog(self, initial_port):
         """Muestra un diálogo para que el usuario configure el puerto de conexión."""
@@ -707,7 +859,8 @@ class MultiDeskApp:
         self.room_title_var = tk.StringVar(self.root)
         
         if self.is_host:
-            self.room_title_var.set(f'Sala: {self.current_user} (HOST) | Puerto: {self.port}')
+            mode_text = "(Temporal)" if self.is_temporal_mode.get() else "(Persistente)"
+            self.room_title_var.set(f'Sala: {self.current_user} (HOST {mode_text}) | Puerto: {self.port}')
         else:
             self.room_title_var.set(f'Sala: (Cliente) - {self.current_user} | Puerto: {self.port}')
 
@@ -716,42 +869,77 @@ class MultiDeskApp:
         if self.is_host:
             tk.Button(top_frame, text='Panel de Control', command=self.open_control_panel, bg='lightblue').pack(side=tk.RIGHT)
         
-        # Botón para abrir el panel de Debug (SOLO en la Sala)
-        tk.Button(self.root, text='Diagnóstico', command=self.open_debug_panel, bg='lightgray').pack(pady=5)
+        # Botones de control
+        control_frame = tk.Frame(self.root)
+        control_frame.pack(pady=5)
         
-        tk.Button(self.root, text='Seleccionar Archivo', command=self.select_file).pack(pady=5)
-        tk.Button(self.root, text='Salir', command=self.leave_room).pack(pady=5)
+        tk.Button(control_frame, text='Seleccionar Archivo (Subir)', command=self.select_file).pack(side=tk.LEFT, padx=5)
+        tk.Button(control_frame, text='Diagnóstico', command=self.open_debug_panel, bg='lightgray').pack(side=tk.LEFT, padx=5)
+        tk.Button(control_frame, text='Salir', command=self.leave_room).pack(side=tk.LEFT, padx=5)
+        
+        # 🆕 Botones de gestión de archivos (Cliente/Descarga)
+        file_action_frame = tk.Frame(self.root)
+        file_action_frame.pack(pady=5)
+        tk.Button(file_action_frame, text='⬇️ Descargar Archivo Seleccionado', command=self.download_selected_file, bg='lightgreen').pack(side=tk.LEFT, padx=5)
+        if not self.is_host:
+            tk.Button(file_action_frame, text='🗑️ Eliminar Mi Subida', command=self.client_delete_file, fg='red').pack(side=tk.LEFT, padx=5)
         
         # Etiqueta de la lista de archivos
-        tk.Label(self.root, text='Lista de Archivos Compartidos:', font=('Arial', 10, 'bold')).pack(pady=(10, 0))
+        tk.Label(self.root, text='Lista de Archivos Compartidos (No descargados localmente):', font=('Arial', 10, 'bold')).pack(pady=(10, 0))
 
         self.files_listbox = tk.Listbox(self.root, width=70)
         self.files_listbox.pack()
-        self.files_listbox.bind('<Double-Button-1>', self.open_selected_file)
+        # 🆕 Desactiva el doble click para abrir automáticamente, se usa el botón de descarga
+        # self.files_listbox.bind('<Double-Button-1>', self.open_selected_file) 
         self.update_files()
-        
+            
     def open_control_panel(self):
         HostControlPanel(self.root, self)
 
     def leave_room(self):
-        self.client_updater_running = False
-        
+        if not self.is_host and self.host_ip:
+            # 🆕 Cliente notifica al Host que se va
+            self.client_updater_running = False
+            self.update_debug_info("Notificando al host de la desconexión...")
+            try:
+                headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip}
+                self.session.delete(f'http://{self.host_ip}:{self.port}/leave', headers=headers, timeout=2)
+            except requests.exceptions.RequestException:
+                pass # El host ya puede estar cerrado, ignorar errores de conexión
+            
         if self.is_host:
             # Limpieza para el HOST: Apagar el servidor completamente
             if self.server:
+                # El server.closed flag se establece en HostControlPanel.close_room (si se usa)
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 self.server = None
-            self.is_host = False
-            self.update_debug_info("Servidor detenido.", is_error=False)
-            messagebox.showinfo("Sala Cerrada", "El servidor se ha detenido. Volviendo al menú principal.")
+                self.update_debug_info("Servidor detenido.", is_error=False)
+                messagebox.showinfo("Sala Cerrada", "El servidor se ha detenido. Volviendo al menú principal.")
         
         # Limpieza para el CLIENTE: simplemente vuelve al menú principal y resetea el puerto a 8000
         self.port = 8000
-        self.setup_main_menu()
+        self.host_ip = ''
+        self.setup_main_menu() # 🆕 setup_main_menu maneja la limpieza temporal
+
+    def force_client_leave(self, reason="El Host cerró la sala."):
+        self.client_updater_running = False
+        messagebox.showerror('Desconexión', reason)
+        self.root.after(0, self.setup_main_menu)
 
     def fetch_and_update_client_files(self):
         while self.client_updater_running:
             try:
+                # 🆕 1. Primero, verifica el estado del Host
+                status_url = f'http://{self.host_ip}:{self.port}/status'
+                r_status = self.session.get(status_url, timeout=3)
+                r_status.raise_for_status()
+                status = r_status.json().get('status', 'open')
+                
+                if status == 'closed':
+                    self.root.after(0, lambda: self.force_client_leave("El host ha cerrado la sala."))
+                    return # Detiene el hilo
+                
+                # 2. Obtiene la lista de archivos
                 url = f'http://{self.host_ip}:{self.port}/files_list'
                 # Envía el Username en el encabezado para registrarse en el Host
                 headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip} 
@@ -769,21 +957,29 @@ class MultiDeskApp:
                 
                 if self.files_listbox:
                     self.files_listbox.delete(0, tk.END)
+                    
+                    # 🆕 Se obtiene la lista de archivos locales para diferenciar
+                    local_files = set(os.listdir(MULTIDESK_DIR))
+                    EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
+                    
                     for item in files_data:
                         fname = urllib.parse.unquote(item['name'])
                         uploader = item['uploader']
-                        display = f"{fname:<40} (Subido por: {uploader})" if uploader else fname
+                        
+                        # 🆕 Marcador (Local)
+                        download_status = " (Local)" if fname in local_files and fname not in EXCLUDED_FILES else ""
+                        display = f"{fname:<40} (Subido por: {uploader}){download_status}"
                         self.files_listbox.insert(tk.END, display)
                     
-                    self.update_debug_info("Lista de archivos actualizada.", is_error=False)
+                    self.update_debug_info(f"Lista de archivos actualizada desde {self.host_ip} con {len(files_data)} items.")
                         
             except requests.exceptions.RequestException as e:
                 if self.client_updater_running:
                     # Muestra error de actualización en el panel
-                    self.update_debug_info(f"Fallo al obtener lista de archivos: {e}", is_error=True)
+                    self.update_debug_info(f"Fallo al obtener lista de archivos o status: {e}", is_error=True)
             
             time.sleep(FILE_UPDATE_INTERVAL / 1000)
-
+    
     # --- [ Envío de Archivos ] ---
     def select_file(self):
         file_path = filedialog.askopenfilename()
@@ -839,6 +1035,100 @@ class MultiDeskApp:
             open_file(os.path.join(MULTIDESK_DIR, filename))
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # --- [ Descarga y Eliminación de Archivos (Cliente) ] ---
+    def download_selected_file(self):
+        try:
+            # 1. Obtiene el nombre real del archivo
+            selected_indices = self.files_listbox.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Error", "Selecciona un archivo para descargar.")
+                return
+
+            text = self.files_listbox.get(selected_indices[0])
+            # Extrae solo el nombre del archivo (antes del primer espacio)
+            filename = text.split(' ')[0] 
+            
+            # 2. Verifica si ya existe localmente
+            dest_path = os.path.join(MULTIDESK_DIR, filename)
+            if os.path.exists(dest_path):
+                confirm = messagebox.askyesno("Confirmar Sobreescritura", 
+                                              f"El archivo '{filename}' ya existe localmente.\n¿Deseas descargarlo de nuevo y sobreescribir la versión local?")
+                if not confirm:
+                    return
+
+            # 3. Descarga
+            url = f'http://{self.host_ip}:{self.port}/{urllib.parse.quote(filename)}'
+            self.update_debug_info(f"Iniciando descarga de {filename}...")
+            r = self.session.get(url, timeout=30)
+            r.raise_for_status()
+
+            with open(dest_path, 'wb') as f:
+                f.write(r.content)
+            
+            messagebox.showinfo("Descarga Exitosa", f"'{filename}' descargado correctamente a la carpeta MultiDesk.")
+            self.update_debug_info(f"Descarga de {filename} completada.")
+            self.update_files() # Actualiza la lista para mostrar el tag "(Local)"
+
+        except requests.exceptions.RequestException as e:
+            self.update_debug_info(f"Error de descarga: {e}", is_error=True)
+            messagebox.showerror("Error de Descarga", f"Fallo la descarga o el archivo no existe en el Host: {e}")
+        except Exception as e:
+            self.update_debug_info(f"Error inesperado: {e}", is_error=True)
+            messagebox.showerror("Error", f"Error inesperado: {e}")
+
+    def client_delete_file(self):
+        """Permite al cliente eliminar un archivo que haya subido, en el Host."""
+        if self.is_host:
+            return # El host usa el Panel de Control
+
+        try:
+            # 1. Obtiene el nombre real del archivo
+            selected_indices = self.files_listbox.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Error", "Selecciona un archivo de la lista para eliminar.")
+                return
+
+            text = self.files_listbox.get(selected_indices[0])
+            filename = text.split(' ')[0] 
+            
+            if not messagebox.askyesno("Confirmar Eliminación", 
+                                        f"¿Estás seguro de que quieres solicitar al Host la eliminación de tu archivo '{filename}'?\n\nSolo el uploader puede eliminar un archivo."):
+                return
+            
+            # 2. Solicita al Host la eliminación
+            url = f'http://{self.host_ip}:{self.port}/delete_file'
+            headers = {
+                'X-Username': self.current_user, 
+                'X-Client-Ip': self.local_ip,
+                'X-Filename': urllib.parse.quote(filename)
+            }
+            
+            self.update_debug_info(f"Solicitando al Host la eliminación de {filename}...")
+            r = self.session.delete(url, headers=headers, timeout=5)
+            r.raise_for_status() # Lanza error si el código no es 2xx
+
+            # 3. Éxito: Elimina la versión local (si existe)
+            local_path = os.path.join(MULTIDESK_DIR, filename)
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            
+            messagebox.showinfo("Éxito", f"'{filename}' fue eliminado del Host y de tu carpeta local.")
+            self.update_debug_info(f"Eliminación de {filename} confirmada por el Host.")
+            
+        except requests.exceptions.HTTPError as e:
+            # Captura errores como 403 Forbidden (no es el uploader)
+            error_message = f"Error al eliminar: {e}"
+            if e.response.status_code == 403:
+                 error_message = "No autorizado. Solo puedes eliminar tus propias subidas."
+            messagebox.showerror("Error de Eliminación", error_message)
+            self.update_debug_info(f"Fallo al eliminar {filename} (HTTP {e.response.status_code}): {e}", is_error=True)
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Error de Conexión", f"Fallo de conexión con el Host: {e}")
+            self.update_debug_info(f"Fallo de conexión en DELETE: {e}", is_error=True)
+        except Exception as e:
+            self.update_debug_info(f"Error inesperado: {e}", is_error=True)
+            messagebox.showerror("Error", f"Error inesperado: {e}")
 
 
 if __name__ == "__main__":
