@@ -69,40 +69,6 @@ class AuthTCPServer(socketserver.TCPServer):
         return True
 
 
- # --- [ SERVIDOR Y HANDLER HTTP ] ---
-class AuthTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
-    def __init__(self, server_address, RequestHandlerClass, allowed_clients, bind_and_activate=True):
-        self.allowed_clients = allowed_clients
-        self.participants_ips = set()
-        self.user_map = {}
-        self.closed = False
-        self.app_instance = None
-        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
- 
-    def verify_request(self, request, client_address):
-        ip = client_address[0]
-        self.participants_ips.add(ip)
-        return True
-
-
-# --- [ SERVIDOR Y HANDLER HTTP ] ---
-class AuthTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
-    def __init__(self, server_address, RequestHandlerClass, allowed_clients, bind_and_activate=True):
-        self.allowed_clients = allowed_clients
-        self.participants_ips = set()
-        self.user_map = {}
-        self.closed = False
-        self.app_instance = None
-        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
- 
-    def verify_request(self, request, client_address):
-        ip = client_address[0]
-        self.participants_ips.add(ip)
-        return True
-
-
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, app_instance=None, base_dir=None, **kwargs):
         self.base_dir = base_dir or MULTIDESK_DIR
@@ -116,74 +82,95 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         return self.client_address[0]
 
     def do_GET(self):
-        # 🆕 Permite manejar archivos con caracteres especiales decodificando el path
-        local_path = urllib.parse.unquote(self.path.lstrip('/'))
-        file_path = os.path.join(self.base_dir, local_path)
-
-        if self.path == '/status':
-            status = 'closed' if hasattr(self.server, 'closed') and self.server.closed else 'open'
+        """Maneja las peticiones GET, incluyendo la descarga de archivos, lista de archivos y estado."""
+        # Sanitizar el path recibido, eliminando el path inicial de la URL
+        path = self.path
+        if path.startswith('/'):
+            path = path[1:]
+            
+        # -----------------------------------------------------
+        # Manejo de peticiones /status (para verificar si el host está activo)
+        if path == 'status':
             self.send_response(200)
-            self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(f'{{"status":"{status}"}}'.encode('utf-8'))
+            self.wfile.write(json.dumps({'status': 'online', 'host': self.server.app.host_username}).encode('utf-8'))
+            return
             
-        elif self.path == '/files_list':
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
+        # -----------------------------------------------------
+        # Manejo de peticiones /files_list (para la lista de archivos)
+        if path == 'files_list':
+            
+            # 1. Obtenemos el nombre desambiguado (ej: "Juan 1")
+            # 🆕 Usamos la nueva función para obtener el nombre único.
+            resolved_username = self._get_username_from_headers(self.headers)
+            client_ip = self.headers.get('X-Client-Ip')
+            
+            if resolved_username and client_ip:
+                
+                # 2. Almacenamos el nombre desambiguado en el mapa del servidor.
+                # Si es una nueva conexión, o si el nombre desambiguado es diferente:
+                if client_ip not in self.server.user_map or self.server.user_map.get(client_ip) != resolved_username:
+                    
+                    # 💡 Almacenamos el nombre resuelto (que puede ser desambiguado o no)
+                    self.server.user_map[client_ip] = resolved_username 
+                    self.server.app.update_debug_info(f"Cliente '{resolved_username}' ({client_ip}) se ha conectado.")
+                
+                # 3. Devolver el nombre de usuario desambiguado en la respuesta HTTP
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                # 🆕 Devolvemos el nombre resuelto para que el cliente actualice su estado.
+                self.send_header('X-Username-Resolved', urllib.parse.quote(resolved_username)) 
+                self.end_headers()
+                
+                # Prepara la lista de archivos para enviar
+                files_info = []
+                for fname in os.listdir(MULTIDESK_DIR):
+                    filepath = os.path.join(MULTIDESK_DIR, fname)
+                    if os.path.isfile(filepath) and not fname.startswith('.'):
+                        uploader = self.server.app.upload_history.get(fname, 'Desconocido')
+                        files_info.append({
+                            'name': fname,
+                            'size': os.path.getsize(filepath),
+                            'uploader': uploader
+                        })
 
-            # Registrar usuario al acceder a la lista (sin subir archivos)
-            uploader = self.headers.get('X-Username')
-            client_ip = self.get_client_ip()
-            if uploader and self.app and self.app.is_host:
-                self.server.user_map[client_ip] = uploader
-                self.app.update_debug_info(f"Usuario {uploader} ({client_ip}) consultando lista de archivos.") # 🆕 Debug Host
-            
-            files_data = {
-                'host_username': self.app.current_user if self.app and self.app.is_host else '',
-                'files': []
-            }
-            
-            EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
-            
-            for fname in os.listdir(self.base_dir):
-                if os.path.isfile(os.path.join(self.base_dir, fname)) and not fname.startswith('.') and fname not in EXCLUDED_FILES:
-                    uploader = self.app.upload_history.get(fname, '') if self.app else ''
-                    # 🆕 Asegura que el nombre del archivo esté codificado en la respuesta JSON
-                    files_data['files'].append({'name': urllib.parse.quote(fname), 'uploader': uploader}) 
-            
-            self.wfile.write(json.dumps(files_data).encode('utf-8'))
+                self.wfile.write(json.dumps({'files': files_info, 'host_name': HOST_SYSTEM_NAME}).encode('utf-8'))
+                return
+            else:
+                self.send_error(401, "Falta la autenticación (X-Username o X-Client-Ip).")
+                return
 
-        elif self.path == '/':
-            # ... (Lógica de la página HTML simple) ...
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            files = os.listdir(self.base_dir)
-            html = "<html><body><h2>Archivos disponibles</h2><ul>"
-            
-            EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
+        # -----------------------------------------------------
+        # Manejo de peticiones de descarga de archivos
+        
+        # Decodificar el path para manejar espacios y caracteres especiales en nombres de archivos
+        filename = urllib.parse.unquote(path)
+        filepath = os.path.join(MULTIDESK_DIR, filename)
+        
+        # Evitar el acceso a archivos de log o DB
+        if filename in {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)} or filename.startswith('.'):
+             self.send_error(403, "Acceso denegado a archivos del sistema.")
+             return
+             
+        # La lógica original de SimpleHTTPRequestHandler utiliza os.getcwd() como base.
+        # Necesitamos sobrescribir para usar MULTIDESK_DIR y solo permitir descargas de archivos.
+        if os.path.isfile(filepath):
+            try:
+                self.send_response(200)
+                self.send_header("Content-type", self.guess_type(filepath))
+                self.send_header("Content-Length", str(os.path.getsize(filepath)))
+                # Sugerir la descarga con el nombre original del archivo
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.end_headers()
 
-            for fname in files:
-                if os.path.isfile(os.path.join(self.base_dir, fname)) and not fname.startswith('.'):
-                    if fname in EXCLUDED_FILES:
-                        continue
-                    # 🆕 Codificación URL para que el navegador lo maneje bien
-                    html += f'<li><a href="{urllib.parse.quote(fname)}">{fname}</a></li>'
-            html += "</ul></body></html>"
-            self.wfile.write(html.encode('utf-8'))
-
-        # 🆕 El acceso a archivos se realiza con el nombre decodificado (local_path)
-        elif os.path.isfile(file_path):
-            self.send_response(200)
-            self.send_header("Content-type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{local_path}"') # 🆕 Header para sugerir descarga con nombre original
-            self.send_header("Content-Length", str(os.path.getsize(file_path)))
-            self.end_headers()
-            with open(file_path, 'rb') as f:
-                self.wfile.write(f.read())
-        else:
-            self.send_error(404)
+                with open(filepath, 'rb') as file:
+                    shutil.copyfileobj(file, self.wfile)
+            except Exception as e:
+                self.send_error(500, f"Error al servir el archivo: {e}")
+            return
+        
+        # Si no es un archivo de sistema, no es files_list, ni status, ni un archivo válido:
+        self.send_error(404, "Archivo o Recurso no encontrado")
 
     def do_POST(self):
         try:
@@ -216,6 +203,37 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             print(f"[ERROR POST] {e}")
             self.send_error(500, f"Error interno: {e}")
+    
+    def _get_username_from_headers(self, headers):
+        """
+        Obtiene el nombre de usuario de los headers y, si es un nombre duplicado en la sesión
+        actual (ya presente en user_map.values()), lo desambigua con un sufijo numérico 
+        (ej: Juan 1, Juan 2).
+        """
+        username = headers.get('X-Username')
+        if not username:
+            return None
+            
+        server = self.server
+        
+        # 🆕 Lógica de Desambiguación: Solo aplicable si el nombre ya está en uso.
+        
+        # 1. Chequeo Rápido: Si el nombre ya está en uso por otro cliente, necesitamos desambiguar.
+        if username in server.user_map.values():
+            
+            base_username = username
+            counter = 1
+            new_username = f"{base_username} {counter}"
+            
+            # Buscar el sufijo numérico más bajo que no esté en uso.
+            while new_username in server.user_map.values():
+                counter += 1
+                new_username = f"{base_username} {counter}"
+                
+            return new_username
+            
+        # 2. Si el nombre no está en uso, se devuelve sin modificar.
+        return username
 
     # 🆕 Maneja la eliminación de usuarios y archivos
     def do_DELETE(self):
@@ -250,6 +268,61 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+# --- [ PANEL DE DEBUG ] ---
+class DebugPanel:
+    def __init__(self, master, app):
+        self.master = master
+        self.app = app
+        self.dialog = Toplevel(master)
+        self.dialog.title("Panel de Diagnóstico (Debug)")
+        self.dialog.geometry("600x350")
+        self.dialog.transient(master)
+        self.dialog.grab_set()
+        self.dialog.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Contenedor para la lista de mensajes
+        frame = tk.Frame(self.dialog)
+        frame.pack(pady=10, padx=10, expand=True, fill="both")
+
+        # Configuración del Listbox y Scrollbar
+        scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
+        self.info_listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, width=80, height=15)
+        scrollbar.config(command=self.info_listbox.yview)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.info_listbox.pack(side=tk.LEFT, fill="both", expand=True)
+
+        self.add_system_info()
+
+    def add_system_info(self):
+        """Añade información de sistema al inicio del panel."""
+        self.update_info(f"--- [ INICIO DEL DIAGNÓSTICO ] ---")
+        self.update_info(f"Sistema Operativo: {sys.platform} ({os.name})")
+        self.update_info(f"Hostname: {HOST_SYSTEM_NAME}")
+        self.update_info(f"IP Local (Reportada): {self.app.local_ip}")
+        self.update_info(f"Directorio MultiDesk: {MULTIDESK_DIR}")
+        self.update_info(f"---")
+
+    def update_info(self, message, is_error=False):
+        """Función para añadir mensajes al listbox desde cualquier parte de la app."""
+        color = 'red' if is_error else 'darkgreen' if message.startswith('[DEBUG]') else 'black'
+        
+        # Insertar con la hora actual
+        now = time.strftime("[%H:%M:%S]")
+        display_message = f"{now} {message}"
+        
+        self.info_listbox.insert(tk.END, display_message)
+        self.info_listbox.itemconfig(tk.END, {'fg': color})
+        
+        # Scroll automático al final
+        self.info_listbox.see(tk.END)
+
+    def on_close(self):
+        """Limpia la referencia al cerrar el panel."""
+        self.app.debug_panel_instance = None
+        self.dialog.destroy()
+
 
 # --- [ PANEL DE CONTROL DEL HOST ] ---
 class HostControlPanel:
@@ -381,7 +454,7 @@ class HostControlPanel:
                 self.app.server = None # Limpiar la referencia
                 
             # 🆕 Limpieza si el HOST está en modo temporal
-            if self.app.is_temporal_mode:
+            if self.app.is_temporal_mode.get():
                 cleanup_count = cleanup_multidesk(is_host=True)
                 messagebox.showinfo("Limpieza", f"Modo temporal activo: Se eliminaron {cleanup_count} archivos locales.")
 
@@ -645,24 +718,38 @@ class MultiDeskApp:
     def show_register_dialog(self, username=None, password=None):
         dialog = Toplevel(self.root)
         dialog.title("Registrar Usuario")
-        dialog.geometry("300x150")
+        # 🆕 Ajusta la geometría para dar espacio al botón de info
+        dialog.geometry("350x180")
         dialog.transient(self.root)
         dialog.grab_set()
+
+        # Frame para la contraseña y el botón de info
+        pass_frame = tk.Frame(dialog)
+        pass_frame.pack(pady=5)
 
         tk.Label(dialog, text="Usuario:").pack(pady=5)
         user_entry = tk.Entry(dialog)
         user_entry.pack()
         if username: user_entry.insert(0, username)
         
-        tk.Label(dialog, text="Contraseña:").pack(pady=5)
-        pass_entry = tk.Entry(dialog, show='*')
-        pass_entry.pack()
+        tk.Label(pass_frame, text="Contraseña:").pack(side=tk.LEFT)
+        pass_entry = tk.Entry(pass_frame, show='*')
+        pass_entry.pack(side=tk.LEFT, padx=(0, 5))
         if password: pass_entry.insert(0, password)
+        
+        # 🆕 Botón de información
+        info_button = tk.Button(pass_frame, text="ⓘ", 
+                                command=self.show_password_requirements, 
+                                relief=tk.FLAT)
+        info_button.pack(side=tk.LEFT)
 
         def register_action():
             user = user_entry.get()
             passwd = pass_entry.get()
-            success, msg = self.register_user(user, passwd)
+            
+            # 🆕 Realiza la validación de complejidad de la contraseña aquí
+            success, msg = self.register_user_with_complexity(user, passwd)
+            
             if success:
                 messagebox.showinfo("Éxito", msg)
                 dialog.destroy()
@@ -672,13 +759,74 @@ class MultiDeskApp:
         tk.Button(dialog, text="Registrar", command=register_action).pack(pady=10)
         self.root.wait_window(dialog)
 
+    # 🆕 Nuevo método para mostrar los requisitos de la contraseña
+    def show_password_requirements(self):
+        messagebox.showinfo(
+            "Requisitos de Contraseña",
+            "La contraseña debe cumplir con lo siguiente:\n\n"
+            "1. Al menos 4 caracteres de longitud.\n"
+            "2. Contener al menos una letra mayúscula.\n"
+            "3. Contener al menos una letra minúscula.\n"
+            "4. Contener al menos un número.\n"
+            "5. Contener al menos un símbolo (!@-_)."
+        )
+
+    # 🆕 Nuevo método que envuelve el registro con una verificación de complejidad
+    def register_user_with_complexity(self, username, password):
+        if not username or not password:
+         return False, "El nombre de usuario y la contraseña no pueden estar vacíos."
+        
+        # 2. Validación de Complejidad (Mayúsculas, Minúsculas, Números, Símbolos)
+        has_upper = any(c.isupper() for c in password)
+        has_lower = any(c.islower() for c in password)
+        has_digit = any(c.isdigit() for c in password)
+        
+        # Símbolos permitidos: !@-_
+        allowed_symbols = "!@-_"
+        has_symbol = any(c in allowed_symbols for c in password)
+        
+        if not all([has_upper, has_lower, has_digit, has_symbol]):
+            self.show_password_requirements() # Muestra los requisitos al fallar
+            return False, "La contraseña no cumple con los requisitos de complejidad."
+
+        # 3. Si la complejidad es correcta, procede con el registro original
+        # Aquí reutilizamos el método 'register_user' pero sin la validación de longitud, 
+        # que ahora se maneja arriba.
+        
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            h_password = self._hash_password(password)
+            
+            # El código original verificaba la longitud aquí, la removemos.
+            # if len(password) < 4: return False, "La contraseña debe tener al menos 4 caracteres." 
+            
+            cursor.execute("INSERT INTO Usuarios (username, password_hash) VALUES (?, ?)", (username, h_password))
+            conn.commit()
+            conn.close()
+            self.current_user = username
+            return True, "Registro exitoso."
+        except sqlite3.IntegrityError:
+            return False, "El usuario ya existe. El nombre de usuario debe ser único."
+        except Exception as e:
+            return False, f"Error: {e}"
+
     # --- [ HOST / CLIENTE ] ---
     def host_room(self):
         if not self._ask_credentials_and_authenticate():
             return
             
-        if not os.path.exists(MULTIDESK_DIR):
+        # 🆕 1. Verificar si el directorio MultiDesk ya existe.
+        multidesk_existed = os.path.exists(MULTIDESK_DIR)
+        
+        # 2. Si no existe, lo creamos.
+        if not multidesk_existed:
             os.makedirs(MULTIDESK_DIR)
+        
+        # 🆕 3. Si el directorio ya existía, realizamos el chequeo de archivos previos.
+        #    (Si fue recién creado, no hay archivos previos, evitamos el chequeo innecesario).
+        if multidesk_existed:
+            self._check_and_prompt_previous_files()
         
         self.is_host = True
         self.host_username = self.current_user
@@ -703,6 +851,7 @@ class MultiDeskApp:
             messagebox.showerror("Error de Host", "El intento de hostear la sala falló sin un error específico. Inténtalo de nuevo.")
             self.is_host = False
             self.setup_main_menu()
+     
 
     def _start_server_thread(self):
         """Inicia el servidor en un hilo separado."""
@@ -760,7 +909,7 @@ class MultiDeskApp:
         if not messagebox.askyesno(
             "Error al Hostear Sala (Puerto en uso)",
             f"El puerto {self.port} no está disponible, probablemente lo está usando otra aplicación.\n"
-            "¿Quieres ingresar un **puerto diferente** para intentar hostear la sala de nuevo?"
+            "¿Quieres ingresar un puerto diferente para intentar hostear la sala de nuevo?"
         ):
             self.setup_main_menu()
             return
@@ -775,6 +924,47 @@ class MultiDeskApp:
             self.host_room() 
         else:
             self.setup_main_menu()
+
+
+    # --- [ Funciones de Hosteo ] ---
+
+    # 🆕 Nuevo método para avisar al Host sobre archivos previos.
+    def _check_and_prompt_previous_files(self):
+        """Revisa si hay archivos remanentes en MultiDesk y pregunta si desea eliminarlos."""
+        EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
+        
+        # Obtener lista de archivos a eliminar (no logs, no DB)
+        previous_files = []
+        for fname in os.listdir(MULTIDESK_DIR):
+            filepath = os.path.join(MULTIDESK_DIR, fname)
+            if os.path.isfile(filepath) and not fname.startswith('.') and fname not in EXCLUDED_FILES:
+                previous_files.append(fname)
+
+        if previous_files:
+            file_count = len(previous_files)
+            
+            # Formatear la lista para mostrar en el mensaje
+            file_list_str = "\n".join(previous_files[:5])
+            if file_count > 5:
+                file_list_str += f"\n... y {file_count - 5} más."
+                
+            confirm = messagebox.askyesno(
+                "Archivos Previos Detectados",
+                f"Se detectaron {file_count} archivo(s) de una sesión anterior en la carpeta MultiDesk:\n\n"
+                f"{file_list_str}\n\n"
+                "Si no los elimina, serán visibles para los clientes de esta nueva sala.\n"
+                "¿Desea eliminar estos archivos de la carpeta MultiDesk antes de hostear la nueva sala?"
+            )
+            
+            if confirm:
+                files_deleted = cleanup_multidesk(is_host=True)
+                # Si se eliminan archivos, también se debe vaciar el historial de subidas
+                self.upload_history = {}
+                self.save_upload_history() 
+                messagebox.showinfo("Limpieza Exitosa", f"Se eliminaron {files_deleted} archivos anteriores.")
+
+        # Devuelve el control para que la función host_room continúe
+        return
 
     def connect_room(self):
         if not self._ask_credentials_and_authenticate():
@@ -875,9 +1065,10 @@ class MultiDeskApp:
     def open_control_panel(self):
         HostControlPanel(self.root, self)
 
+    # CÓDIGO MODIFICADO PARA leave_room (Asegura que siempre llama a setup_main_menu)
     def leave_room(self):
         if not self.is_host and self.host_ip:
-            # 🆕 Cliente notifica al Host que se va
+            # Cliente notifica al Host que se va
             self.client_updater_running = False
             self.update_debug_info("Notificando al host de la desconexión...")
             try:
@@ -890,15 +1081,49 @@ class MultiDeskApp:
             # Limpieza para el HOST: Apagar el servidor completamente
             if self.server:
                 # El server.closed flag se establece en HostControlPanel.close_room (si se usa)
+                self.server.closed = True 
+                # El shutdown debe ejecutarse en un hilo separado ya que bloquea el hilo principal
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
-                self.server = None
+                self.server = None # Limpiar la referencia
                 self.update_debug_info("Servidor detenido.", is_error=False)
-                messagebox.showinfo("Sala Cerrada", "El servidor se ha detenido. Volviendo al menú principal.")
         
-        # Limpieza para el CLIENTE: simplemente vuelve al menú principal y resetea el puerto a 8000
+        # Limpieza de estado y retorno al menú principal
         self.port = 8000
         self.host_ip = ''
-        self.setup_main_menu() # 🆕 setup_main_menu maneja la limpieza temporal
+        self.setup_main_menu() # setup_main_menu maneja la limpieza temporal al volver al menú
+    
+    #Método para el cierre total de la aplicación (WM_DELETE_WINDOW)
+    def close_application(self):
+        """Maneja el cierre de la ventana principal, asegurando que cualquier sesión activa se detenga."""
+        
+        # 1. Ejecutar la lógica de limpieza de sesión (Host o Cliente)
+        # Replicamos la lógica esencial de leave_room pero sin la parte de volver al menú.
+        
+        # Limpieza de Cliente
+        if not self.is_host and self.host_ip:
+            self.client_updater_running = False
+            try:
+                headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip}
+                # Notifica al host antes de cerrar (timeout muy bajo)
+                self.session.delete(f'http://{self.host_ip}:{self.port}/leave', headers=headers, timeout=1) 
+            except requests.exceptions.RequestException:
+                pass # Ignorar si la conexión falla
+
+        # Limpieza de Host
+        if self.is_host:
+            if self.server:
+                self.server.closed = True 
+                # El shutdown debe ejecutarse en un hilo separado para NO CONGELAR la UI 
+                # justo antes de la destrucción final.
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                self.server = None
+        
+        # 2. Limpieza final de archivos en modo temporal
+        if self.is_temporal_mode.get():
+            cleanup_multidesk(is_host=self.is_host)
+        
+        # 3. Forzar el cierre de la ventana principal, terminando mainloop()
+        self.root.destroy()
 
     def force_client_leave(self, reason="El Host cerró la sala."):
         self.client_updater_running = False
@@ -906,57 +1131,55 @@ class MultiDeskApp:
         self.root.after(0, self.setup_main_menu)
 
     def fetch_and_update_client_files(self):
+        """Hilo cliente: consulta al Host para la lista de archivos y actualiza la UI."""
+        self.client_updater_running = True
+        
         while self.client_updater_running:
+            if not self.host_ip:
+                self.client_updater_running = False
+                break
+                
             try:
-                # 🆕 1. Primero, verifica el estado del Host
-                status_url = f'http://{self.host_ip}:{self.port}/status'
-                r_status = self.session.get(status_url, timeout=3)
-                r_status.raise_for_status()
-                status = r_status.json().get('status', 'open')
+                # Usamos el nombre actual (puede ser el original o ya desambiguado)
+                headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip}
+                response = self.session.get(f'http://{self.host_ip}:{self.port}/files_list', headers=headers, timeout=5)
                 
-                if status == 'closed':
-                    self.root.after(0, lambda: self.force_client_leave("El host ha cerrado la sala."))
-                    return # Detiene el hilo
-                
-                # 2. Obtiene la lista de archivos
-                url = f'http://{self.host_ip}:{self.port}/files_list'
-                # Envía el Username en el encabezado para registrarse en el Host
-                headers = {'X-Username': self.current_user, 'X-Client-Ip': self.local_ip} 
-                r = self.session.get(url, headers=headers, timeout=3)
-                r.raise_for_status()
-
-                files_response = r.json()
-                
-                self.host_username = files_response['host_username']
-                
-                # Actualiza el título del Label en la ventana principal
-                self.root.after(0, lambda: self.room_title_var.set(f'Sala: {self.host_username} (HOST) - {self.current_user} (Cliente) | Puerto: {self.port}'))
-                
-                files_data = files_response['files']
-                
-                if self.files_listbox:
-                    self.files_listbox.delete(0, tk.END)
-                    
-                    # 🆕 Se obtiene la lista de archivos locales para diferenciar
-                    local_files = set(os.listdir(MULTIDESK_DIR))
-                    EXCLUDED_FILES = {os.path.basename(UPLOAD_LOG_FILE), os.path.basename(DB_NAME)}
-                    
-                    for item in files_data:
-                        fname = urllib.parse.unquote(item['name'])
-                        uploader = item['uploader']
+                if response.status_code == 200:
+                    # 🆕 Recuperar el nombre de usuario desambiguado del Host
+                    resolved_username_encoded = response.headers.get('X-Username-Resolved')
+                    if resolved_username_encoded:
+                        # Si el Host nos dio un nombre único (ej: Juan 1), lo usamos
+                        new_current_user = urllib.parse.unquote(resolved_username_encoded)
+                        if new_current_user != self.current_user:
+                             self.update_debug_info(f"Nombre actualizado por el Host a: {new_current_user}")
+                             self.current_user = new_current_user
                         
-                        # 🆕 Marcador (Local)
-                        download_status = " (Local)" if fname in local_files and fname not in EXCLUDED_FILES else ""
-                        display = f"{fname:<40} (Subido por: {uploader}){download_status}"
-                        self.files_listbox.insert(tk.END, display)
+                    data = response.json()
+                    new_files = data.get('files', [])
+                    self.host_name = data.get('host_name', 'Host Desconocido')
                     
-                    self.update_debug_info(f"Lista de archivos actualizada desde {self.host_ip} con {len(files_data)} items.")
+                    # Comprueba si la lista ha cambiado (optimizando la actualización de la UI)
+                    if new_files != self.files_list:
+                        self.files_list = new_files
+                        self.root.after(0, self._update_client_files_ui)
                         
+                elif response.status_code == 401:
+                    self.client_updater_running = False
+                    self.root.after(0, lambda: messagebox.showerror("Conexión Fallida", "No se pudo autenticar con el Host. Verifique sus credenciales."))
+                    self.root.after(0, self.setup_main_menu)
+                    
+                else:
+                    # Esto incluye 404 si el host ya no sirve /files_list
+                    self.update_debug_info(f"Host respondió con status {response.status_code}", is_error=True)
+                    
             except requests.exceptions.RequestException as e:
-                if self.client_updater_running:
-                    # Muestra error de actualización en el panel
-                    self.update_debug_info(f"Fallo al obtener lista de archivos o status: {e}", is_error=True)
-            
+                self.client_updater_running = False
+                self.root.after(0, lambda: messagebox.showerror("Conexión Terminada", f"El Host ha cerrado la conexión o no responde."))
+                self.root.after(0, self.setup_main_menu)
+                break
+            except Exception as e:
+                self.update_debug_info(f"Error inesperado en el hilo de actualización: {e}", is_error=True)
+
             time.sleep(FILE_UPDATE_INTERVAL / 1000)
     
     # --- [ Envío de Archivos ] ---
@@ -1015,11 +1238,105 @@ class MultiDeskApp:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    # --- [ Descarga y Eliminación de Archivos (Cliente) ] ---
+    def download_selected_file(self):
+        try:
+            # 1. Obtiene el nombre real del archivo
+            selected_indices = self.files_listbox.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Error", "Selecciona un archivo para descargar.")
+                return
+
+            text = self.files_listbox.get(selected_indices[0])
+            # Extrae solo el nombre del archivo (antes del primer espacio)
+            filename = text.split(' ')[0] 
+            
+            # 2. Verifica si ya existe localmente
+            dest_path = os.path.join(MULTIDESK_DIR, filename)
+            if os.path.exists(dest_path):
+                confirm = messagebox.askyesno("Confirmar Sobreescritura", 
+                                              f"El archivo '{filename}' ya existe localmente.\n¿Deseas descargarlo de nuevo y sobreescribir la versión local?")
+                if not confirm:
+                    return
+
+            # 3. Descarga
+            url = f'http://{self.host_ip}:{self.port}/{urllib.parse.quote(filename)}'
+            self.update_debug_info(f"Iniciando descarga de {filename}...")
+            r = self.session.get(url, timeout=30)
+            r.raise_for_status()
+
+            with open(dest_path, 'wb') as f:
+                f.write(r.content)
+            
+            messagebox.showinfo("Descarga Exitosa", f"'{filename}' descargado correctamente a la carpeta MultiDesk.")
+            self.update_debug_info(f"Descarga de {filename} completada.")
+            self.update_files() # Actualiza la lista para mostrar el tag "(Local)"
+
+        except requests.exceptions.RequestException as e:
+            self.update_debug_info(f"Error de descarga: {e}", is_error=True)
+            messagebox.showerror("Error de Descarga", f"Fallo la descarga o el archivo no existe en el Host: {e}")
+        except Exception as e:
+            self.update_debug_info(f"Error inesperado: {e}", is_error=True)
+            messagebox.showerror("Error", f"Error inesperado: {e}")
+
+    def client_delete_file(self):
+        """Permite al cliente eliminar un archivo que haya subido, en el Host."""
+        if self.is_host:
+            return # El host usa el Panel de Control
+
+        try:
+            # 1. Obtiene el nombre real del archivo
+            selected_indices = self.files_listbox.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Error", "Selecciona un archivo de la lista para eliminar.")
+                return
+
+            text = self.files_listbox.get(selected_indices[0])
+            filename = text.split(' ')[0] 
+            
+            if not messagebox.askyesno("Confirmar Eliminación", 
+                                        f"¿Estás seguro de que quieres solicitar al Host la eliminación de tu archivo '{filename}'?\n\nSolo el uploader puede eliminar un archivo."):
+                return
+            
+            # 2. Solicita al Host la eliminación
+            url = f'http://{self.host_ip}:{self.port}/delete_file'
+            headers = {
+                'X-Username': self.current_user, 
+                'X-Client-Ip': self.local_ip,
+                'X-Filename': urllib.parse.quote(filename)
+            }
+            
+            self.update_debug_info(f"Solicitando al Host la eliminación de {filename}...")
+            r = self.session.delete(url, headers=headers, timeout=5)
+            r.raise_for_status() # Lanza error si el código no es 2xx
+
+            # 3. Éxito: Elimina la versión local (si existe)
+            local_path = os.path.join(MULTIDESK_DIR, filename)
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            
+            messagebox.showinfo("Éxito", f"'{filename}' fue eliminado del Host y de tu carpeta local.")
+            self.update_debug_info(f"Eliminación de {filename} confirmada por el Host.")
+            
+        except requests.exceptions.HTTPError as e:
+            # Captura errores como 403 Forbidden (no es el uploader)
+            error_message = f"Error al eliminar: {e}"
+            if e.response.status_code == 403:
+                 error_message = "No autorizado. Solo puedes eliminar tus propias subidas."
+            messagebox.showerror("Error de Eliminación", error_message)
+            self.update_debug_info(f"Fallo al eliminar {filename} (HTTP {e.response.status_code}): {e}", is_error=True)
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror("Error de Conexión", f"Fallo de conexión con el Host: {e}")
+            self.update_debug_info(f"Fallo de conexión en DELETE: {e}", is_error=True)
+        except Exception as e:
+            self.update_debug_info(f"Error inesperado: {e}", is_error=True)
+            messagebox.showerror("Error", f"Error inesperado: {e}")
+
 
 if __name__ == "__main__":
     if not os.path.exists(MULTIDESK_DIR):
         os.makedirs(MULTIDESK_DIR)
     root = tk.Tk()
     app = MultiDeskApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.leave_room)
+    root.protocol("WM_DELETE_WINDOW", app.close_application)
     root.mainloop()
