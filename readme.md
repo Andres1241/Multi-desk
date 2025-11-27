@@ -1,5 +1,6 @@
-🐍 Proyecto en Python - MultiDesk 5.0 (LPR 5° 3° A-B, 2025)
-📖 Descripción
+Proyecto en Python - MultiDesk 5.0 (LPR 5° 3° A-B, 2025)
+
+Descripción:
 MultiDesk 5.0 es una aplicación de escritorio con interfaz gráfica (GUI) desarrollada en Python, diseñada para la transferencia segura de archivos en una red local (LAN) o a través de Internet (configurando el puerto).
 
 Su objetivo principal es proveer una solución simple y robusta para el intercambio de documentos bajo un esquema de Host y Cliente. Un usuario crea una "sala" (Host, ejecutando un servidor HTTP ligero) y otros usuarios se conectan (Clientes) para subir y descargar archivos.
@@ -13,7 +14,8 @@ Control de Archivos: Permite a los usuarios descargar y eliminar sus propias sub
 
 Modo Temporal: Opción para borrar automáticamente todos los archivos compartidos al cerrar la sala.
 
-👥 Integrantes
+Integrantes:
+
 Nombre: Monzón Rocío
 
 Nombre: Augusto Kurtz
@@ -22,14 +24,16 @@ Nombre: Thiago López
 
 Nombre: Andrés Ochoa
 
-⚙️ Requisitos
+Requisitos:
+
 Sistema Operativo: Windows 10/11 (La aplicación es un ejecutable autónomo)
 
 Archivos: Solo requiere el archivo Multi-Desk_5.0.exe.
 
 Nota: No es necesario tener Python instalado, ya que el ejecutable incluye todas las librerías necesarias.
 
-🚀 Ejecución
+Ejecución:
+
 Descargar el archivo Multi-Desk_5.0.exe.
 
 Moverlo a una carpeta de trabajo permanente (ej. C:\Users\...\MultiDesk).
@@ -40,7 +44,7 @@ Al ejecutarse por primera vez, se crearán automáticamente la base de datos (mu
 
 <hr>
 
-🗂️ Estructura del Proyecto (Después de la Ejecución)
+Estructura del Proyecto (Después de la Ejecución)
 El ejecutable es un archivo autónomo que genera los archivos de datos a su lado para mantener la información persistente.
 
 Ejecutables/
@@ -54,7 +58,7 @@ Ejecutables/
 
 <hr>
 
-📄 Licencia
+Licencia
 MIT License
 
 ✅ Recordá mantener este archivo actualizado con los avances del proyecto.
